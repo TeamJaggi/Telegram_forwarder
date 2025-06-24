@@ -1,0 +1,3 @@
+aiohttp==3.9.5
+# Add other libraries if your bot code implicitly uses them, e.g.:
+# python-telegram-bot # (If you decide to switch to this library later)
