@@ -3,22 +3,20 @@ import json
 import os
 import re
 import logging
-import ssl # Import ssl module
+import ssl # Still imported, but often not used directly for Render deployments
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
 import aiohttp
 from aiohttp import web
-# Removed requests as aiohttp.ClientSession is used consistently
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
+        logging.StreamHandler() # Essential for Render logs
     ]
 )
 logger = logging.getLogger(__name__)
@@ -55,8 +53,8 @@ class TelegramForwarderBot:
         self.config = self.load_config()
         # Ensure config matches constructor arguments, prioritizing passed values
         self.config.bot_token = bot_token
-        self.config.webhook_url = webhook_url
-        self.config.webhook_port = webhook_port
+        self.config.webhook_url = webhook_url # This will come from env var via main()
+        self.config.webhook_port = webhook_port # This will come from env var via main()
         
         self.app = web.Application()
         self.setup_routes()
@@ -86,7 +84,9 @@ class TelegramForwarderBot:
                 logger.error(f"An unexpected error occurred loading config: {e}. Creating default config.")
         
         logger.info("No existing config file or error loading it. Creating a new default configuration.")
-        return BotConfig(bot_token="") # Return a default config if loading fails or file doesn't exist
+        # When creating a new default, use the token provided at runtime for new config,
+        # but other webhook details might not be known yet.
+        return BotConfig(bot_token=self.bot_token)
     
     def save_config(self):
         """Save configuration to file."""
@@ -1163,10 +1163,10 @@ Usage:
                           Required if your server uses a self-signed certificate.
         """
         if not self.config.webhook_url:
-            logger.warning("No webhook URL configured in bot_config.json. Skipping webhook setup.")
-            return
+            logger.warning("No webhook URL configured. Cannot set webhook without a URL.")
+            return {"ok": False, "description": "Webhook URL not configured."}
 
-        webhook_full_url = f"{self.config.webhook_url}/webhook"
+        webhook_full_url = f"{self.config.webhook_url}" # Changed from /webhook to just the URL as /webhook is now part of WEBHOOK_URL env var
         logger.info(f"Attempting to set webhook to: {webhook_full_url}")
 
         payload = {
@@ -1174,16 +1174,13 @@ Usage:
             "max_connections": 40, # Limit concurrent updates
             "drop_pending_updates": True # Drop updates while bot was offline/reconfiguring
         }
-
-        # If a certificate path is provided, send the certificate file
+        
+        # Note: Render provides HTTPS automatically, so you usually don't need to send a cert.
+        # This part of the code is more for self-hosted solutions.
         if cert_path and os.path.exists(cert_path):
+            logger.warning("Attempting to send certificate to Telegram, but Render handles HTTPS. This might be unnecessary.")
             try:
                 with open(cert_path, 'rb') as cert_file:
-                    files = {'certificate': cert_file}
-                    # For sending files, aiohttp.FormData is typically used or raw multi-part form data
-                    # Let's switch to requests for simplicity of file upload in this specific case,
-                    # or restructure to use aiohttp.FormData
-                    # Sticking to aiohttp.ClientSession for consistency, creating FormData
                     data = aiohttp.FormData()
                     data.add_field('url', webhook_full_url)
                     data.add_field('max_connections', str(payload['max_connections']))
@@ -1205,8 +1202,7 @@ Usage:
                 logger.error(f"Error setting webhook with certificate: {e}", exc_info=True)
                 return {"ok": False, "description": f"Error with certificate: {e}"}
         else:
-            # If no cert_path or file not found, proceed without certificate
-            logger.warning("No valid certificate path provided for webhook. Setting webhook without certificate.")
+            logger.info("Setting webhook without a specific certificate file.")
             return await self._send_api_request("setWebhook", payload)
 
     async def delete_webhook(self):
@@ -1222,14 +1218,14 @@ Usage:
     async def on_startup(self, app):
         """Actions to perform on bot startup."""
         logger.info("Bot starting up...")
+        
         # Initial admin setup if needed
         if not self.config.admin_users:
             logger.warning("No admin users configured. Please set one using the bot's /start command.")
         
         # Set webhook on startup
-        # You would pass your actual certificate path here if you have one.
-        # Example: await self.set_webhook(cert_path="/etc/letsencrypt/live/your_domain/fullchain.pem")
-        await self.set_webhook() # Call without cert for basic setup, add cert_path for production HTTPS
+        # We don't pass cert_path here, as Render handles SSL for us.
+        await self.set_webhook() 
 
     async def on_shutdown(self, app):
         """Actions to perform on bot shutdown."""
@@ -1238,98 +1234,51 @@ Usage:
         self.save_config() # Ensure config is saved one last time
         logger.info("Bot shutdown complete.")
 
-    async def start_webhook(self, cert_file: Optional[str] = None, key_file: Optional[str] = None):
-        """
-        Starts the aiohttp web server to listen for webhooks.
-        :param cert_file: Path to the SSL certificate file for the server (e.g., fullchain.pem).
-        :param key_file: Path to the SSL private key file for the server (e.g., privkey.pem).
-        """
-        self.app.on_startup.append(self.on_startup)
-        self.app.on_shutdown.append(self.on_shutdown)
-
-        ssl_context = None
-        if self.config.webhook_url.startswith("https://"):
-            if cert_file and key_file and os.path.exists(cert_file) and os.path.exists(key_file):
-                try:
-                    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-                    ssl_context.load_cert_chain(cert_file, key_file)
-                    logger.info(f"SSL context loaded from {cert_file} and {key_file}. Server will run on HTTPS.")
-                except Exception as e:
-                    logger.error(f"Error loading SSL certificates: {e}. Falling back to HTTP.", exc_info=True)
-                    ssl_context = None
-            else:
-                logger.warning("Webhook URL is HTTPS but no valid cert/key files provided for aiohttp server. Server will run on HTTP.")
-        
-        if ssl_context:
-            logger.info(f"Starting Aiohttp HTTPS server on port {self.config.webhook_port}...")
-        else:
-            logger.info(f"Starting Aiohttp HTTP server on port {self.config.webhook_port}...")
-        
-        # Running the app needs to be done in your main execution script
-        # For testing, you can use: web.run_app(self.app, port=self.config.webhook_port, ssl_context=ssl_context)
-        # For production, consider gunicorn or similar WSGI servers with aiohttp workers.
-        # This method just prepares the app and hooks.
-
-# Example usage in a main script (e.g., main.py)
-async def main():
-    # Replace with your actual bot token from environment variable or config
+# Main execution block
+# This function is now the direct target of 'python bot.py'
+# It no longer uses asyncio.run() internally.
+# web.run_app() will manage the event loop directly.
+def main():
+    # Retrieve bot token and webhook URL/port from Render environment variables
     bot_token = os.getenv("BOT_TOKEN") 
     if not bot_token:
         logger.critical("BOT_TOKEN environment variable not set. Exiting.")
         return
 
-    # Replace with your actual webhook URL and desired port
-    # For production, this should be your public domain (e.g., https://yourdomain.com)
-    # The port should be one accessible from Telegram (80, 443, 88, 8443)
-    webhook_url = os.getenv("WEBHOOK_URL", "https://your_domain.com") 
-    webhook_port = int(os.getenv("WEBHOOK_PORT", 8443))
+    # WEBHOOK_URL is the public URL Telegram will send updates to
+    # Ensure this variable includes the /webhook path.
+    webhook_url = os.getenv("WEBHOOK_URL") 
+    if not webhook_url:
+        logger.critical("WEBHOOK_URL environment variable not set. Exiting.")
+        return
+        
+    # WEBHOOK_PORT is the port Telegram expects (e.g., 443 for HTTPS)
+    webhook_port = int(os.getenv("WEBHOOK_PORT", 443)) # Default to 443 for HTTPS
+
+    # Render provides its internal listening port via the 'PORT' environment variable
+    # This is the port your aiohttp server should bind to.
+    render_internal_port = int(os.getenv("PORT", 8080)) # Default to 8080 if not set (for local dev)
 
     bot = TelegramForwarderBot(bot_token, webhook_url, webhook_port)
 
-    # If this is the first run and no admins are configured, the /start command will guide the user.
-    # Otherwise, you can check if self.config.admin_users is empty and prompt for one here too.
     if not bot.config.admin_users:
         logger.info("No admin users found in config. Please send /start to the bot in Telegram to set the first admin.")
     
-    # You need to provide your SSL certificate and key files here if you want aiohttp to serve HTTPS directly.
-    # In a production environment, it's more common to use a reverse proxy (Nginx, Caddy) for SSL termination.
-    # Example for direct Aiohttp HTTPS:
-    # cert_file = "/path/to/your/fullchain.pem"
-    # key_file = "/path/to/your/privkey.pem"
-    cert_file = None
-    key_file = None
-
-    # This will set up the webhook on Telegram and start the aiohttp server
-    # for production, you'd typically run this with a WSGI server like gunicorn
-    # For development/testing:
     try:
-        await bot.on_startup(bot.app) # Manually call startup hook for simple run_app
-        web.run_app(bot.app, host='0.0.0.0', port=bot.config.webhook_port, ssl_context=None) # No ssl_context needed if reverse proxy handles SSL
-                                                                                               # If aiohttp serves HTTPS, pass ssl_context here
-    except asyncio.CancelledError:
-        logger.info("Application cancelled, initiating shutdown.")
+        # Pass the startup and shutdown hooks to web.run_app
+        # web.run_app will create and manage the asyncio event loop itself.
+        web.run_app(
+            bot.app,
+            host='0.0.0.0',
+            port=render_internal_port,
+            ssl_context=None, # Render handles SSL
+            on_startup=[bot.on_startup], # Call bot's startup hook
+            on_shutdown=[bot.on_shutdown] # Call bot's shutdown hook
+        )
+        
     except Exception as e:
-        logger.critical(f"Unhandled error during bot startup/runtime: {e}", exc_info=True)
-    finally:
-        await bot.on_shutdown(bot.app) # Manually call shutdown hook
+        logger.critical(f"Unhandled error during bot runtime: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
-    # To run this, you'd typically set environment variables:
-    # export BOT_TOKEN="YOUR_BOT_TOKEN_HERE"
-    # export WEBHOOK_URL="https://your.public.domain.com"
-    # export WEBHOOK_PORT="8443" # Or 443 if you configure your firewall/reverse proxy
-    
-    # Then run the script: python your_bot_file.py
-    
-    # For testing without environment variables, uncomment and replace directly:
-    # os.environ["BOT_TOKEN"] = "YOUR_BOT_TOKEN"
-    # os.environ["WEBHOOK_URL"] = "https://your_ngrok_url.ngrok.io" # Use ngrok for local testing
-    # os.environ["WEBHOOK_PORT"] = "8443"
-
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user (Ctrl+C).")
-    except Exception as e:
-        logger.critical(f"Application terminated due to unhandled exception: {e}", exc_info=True)
+    main() # Directly call main()
