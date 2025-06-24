@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: telegram-forwarder-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mainbot.py
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: ADMIN_USERS
+        value: "[]"
+        sync: false
+      - key: SOURCE_CHANNELS
+        value: "[]"
+        sync: false
+      - key: TARGET_CHANNEL
+        value: ""
+        sync: false
+      - key: FORWARDING_ENABLED
+        value: "false"
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.6"
+    healthCheckPath: /health
